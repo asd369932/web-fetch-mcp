@@ -84,6 +84,30 @@ def _validate_url(url: str) -> str:
     return url
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """重定向也是 SSRF 的入口:urlopen 默认自动跟随,落点不再过检查。
+
+    实测绕过:初始 URL 是公网地址 → 302 到 http://127.0.0.1:port/ →
+    默认行为直接打到内网。这里在每一跳把目标 URL 重新走一遍完整校验
+    (scheme + host IP 类别),任何一跳落在禁区就抛错终止。
+    """
+
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        newurl = newurl.replace(" ", "%20")
+        if not newurl.lower().startswith(("http://", "https://")):
+            raise FetchError(f"重定向到非 http(s) 地址,已阻断: {newurl[:100]}")
+
+        # 每一跳都重新校验(这是修复的核心)
+        try:
+            _validate_url(newurl)
+        except FetchError as e:
+            raise FetchError(f"重定向被 SSRF 防护阻断({e})") from e
+
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class _TextExtractor(HTMLParser):
     """去 script/style,把标签转成空白,保留可读文本。"""
 
@@ -127,19 +151,33 @@ class _TextExtractor(HTMLParser):
         return raw.strip()
 
 
+def _opener() -> urllib.request.OpenerDirector:
+    """带 SSRF 安全检查的重定向处理器的 opener。"""
+    return urllib.request.build_opener(_SafeRedirectHandler())
+
+
 def _http_get(url: str) -> tuple[bytes, str, str]:
-    """返回 (body, content_type, final_url)。大小与超时都有硬边界。"""
+    """返回 (body, content_type, final_url)。大小与超时都有硬边界。
+
+    重定向走 _SafeRedirectHandler:每一跳重新做 SSRF 校验,防止
+    "公网跳板 → 302 → 内网"的绕过。
+    """
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with _opener().open(req, timeout=TIMEOUT) as resp:
             ctype = resp.headers.get("Content-Type", "")
             body = resp.read(MAX_BYTES + 1)
             if len(body) > MAX_BYTES:
                 raise FetchError(f"响应超过 {MAX_BYTES} 字节上限,已中止")
             return body, ctype, resp.geturl()
+    except FetchError:
+        raise
     except urllib.error.HTTPError as e:
         raise FetchError(f"HTTP {e.code} {e.reason}") from e
     except urllib.error.URLError as e:
+        # 重定向处理器里抛的 FetchError 会被 urllib 包进 URLError.reason
+        if isinstance(e.reason, FetchError):
+            raise e.reason
         raise FetchError(f"连接失败: {e.reason}") from e
     except (TimeoutError, socket.timeout) as e:
         raise FetchError(f"超时({TIMEOUT}s)") from e

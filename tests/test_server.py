@@ -163,3 +163,113 @@ class TestFetchLogic:
     def test_connection_error(self, allow_local) -> None:
         out = srv.fetch("http://127.0.0.1:1/")  # 端口 1 必不通
         assert "[拒绝/失败]" in out
+
+
+# ---------------------------------------------------------------------------
+# 重定向 SSRF(回归:verify 子代理实测的绕过)
+# ---------------------------------------------------------------------------
+
+class _Redirector(BaseHTTPRequestHandler):
+    """302 跳板:GET 什么路径都跳到构造时指定的目标。"""
+
+    target = ""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):  # noqa: N802
+        self.send_response(302)
+        self.send_header("Location", self.target)
+        self.send_header("Content-Length", "0")  # 没这行 urllib 读体会撞连接重置
+        self.end_headers()
+
+
+class TestRedirectSSRF:
+    """重定向不能成为 SSRF 的旁路。
+
+    实测绕过:初始 URL 被放行 → 服务器 302 到 127.0.0.1 →
+    默认 urlopen 直接打到内网。修复后每一跳都重新校验。
+
+    测试用两个 loopback 地址区分角色:
+      127.0.0.2 = 模拟"外部可访问的跳板"(patch 后放行)
+      127.0.0.1 = 模拟"内网敏感目标"(真实规则会拦)
+    """
+
+    @pytest.fixture()
+    def servers(self):
+        # 敏感目标:127.0.0.1
+        inner = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=inner.serve_forever, daemon=True).start()
+
+        # 跳板:127.0.0.2
+        class _R(_Redirector):
+            target = f"http://127.0.0.1:{inner.server_port}/"
+
+        redirector = HTTPServer(("127.0.0.2", 0), _R)
+        threading.Thread(target=redirector.serve_forever, daemon=True).start()
+
+        yield {
+            "inner_url": f"http://127.0.0.1:{inner.server_port}/",
+            "redirect_url": f"http://127.0.0.2:{redirector.server_port}/",
+        }
+        redirector.shutdown()
+        inner.shutdown()
+
+    @pytest.fixture()
+    def allow_relay_only(self, monkeypatch: pytest.MonkeyPatch):
+        """模拟"跳板地址在允许列表里,其余按真实规则拦"。"""
+        real_check = srv._check_host
+
+        def patched(host: str) -> None:
+            if host == "127.0.0.2":
+                return  # 跳板被放行(模拟它在公网/白名单)
+            real_check(host)  # 127.0.0.1 走真实校验 → 拦截
+
+        monkeypatch.setattr(srv, "_check_host", patched)
+
+    def test_redirect_to_loopback_blocked(self, servers, allow_relay_only) -> None:
+        out = srv.fetch(servers["redirect_url"])
+        assert "[拒绝/失败]" in out or "阻断" in out, f"重定向 SSRF 未被拦截: {out[:200]}"
+        assert "Hello" not in out and "World" not in out
+
+    def test_redirect_chain_revalidates_each_hop(self, servers, monkeypatch: pytest.MonkeyPatch) -> None:
+        """断言 _check_host 在重定向后被再次调用 —— 证明是"每一跳校验"而非只看初始 URL。"""
+        calls: list[str] = []
+        real_check = srv._check_host
+
+        def patched(host: str) -> None:
+            calls.append(host)
+            if host == "127.0.0.2":
+                return
+            real_check(host)
+
+        monkeypatch.setattr(srv, "_check_host", patched)
+        srv.fetch(servers["redirect_url"])
+
+        assert "127.0.0.2" in calls, "初始 URL 未检查"
+        assert "127.0.0.1" in calls, f"重定向落点未被重新检查(只检查了初始 URL)。调用记录: {calls}"
+
+    def test_normal_redirect_still_works(self, http_server, monkeypatch: pytest.MonkeyPatch) -> None:
+        """修复不能把正常重定向弄坏:跳板→允许的地址应正常返回内容。"""
+        # 目标也在"允许"范围(127.0.0.3 同时扮演两边的放行角色)
+        inner = HTTPServer(("127.0.0.3", 0), Handler)
+        threading.Thread(target=inner.serve_forever, daemon=True).start()
+
+        class _R(_Redirector):
+            target = f"http://127.0.0.3:{inner.server_port}/"
+
+        redirector = HTTPServer(("127.0.0.2", 0), _R)
+        threading.Thread(target=redirector.serve_forever, daemon=True).start()
+
+        def patched(host: str) -> None:
+            if host in ("127.0.0.2", "127.0.0.3"):
+                return
+            srv._check_host(host)
+
+        monkeypatch.setattr(srv, "_check_host", patched)
+        try:
+            out = srv.fetch(f"http://127.0.0.2:{redirector.server_port}/")
+            assert "Hello" in out, f"正常重定向被误伤: {out[:200]}"
+        finally:
+            redirector.shutdown()
+            inner.shutdown()

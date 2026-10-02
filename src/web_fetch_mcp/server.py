@@ -23,6 +23,8 @@ import urllib.request
 from html.parser import HTMLParser
 from typing import Any
 
+import http.client
+
 from mcp.server.mcpserver import MCPServer
 
 server = MCPServer(
@@ -52,8 +54,13 @@ class FetchError(Exception):
     pass
 
 
-def _check_host(host: str) -> None:
-    """解析 host 的全部 IP,任何一个落到禁区即拒绝。"""
+def _check_host(host: str) -> list[str]:
+    """解析 host 的全部 IP,逐个做类别检查,返回检查通过的 IP 列表。
+
+    返回值是关键:连接层拿它 pin(只连这些 IP),让"检查时的解析"与
+    "实际连接的地址"是同一次结果 —— 否则域名解析可被攻击者在两次之间
+    切换(DNS rebinding:检查时返回公网 IP、连接时返回内网 IP)。
+    """
     if host.lower() in _BLOCKED_HOSTS:
         raise FetchError(f"目标地址被禁止(云元数据): {host}")
 
@@ -62,15 +69,19 @@ def _check_host(host: str) -> None:
     except socket.gaierror as e:
         raise FetchError(f"域名解析失败: {host} ({e})") from e
 
+    checked: list[str] = []
     for info in infos:
         ip_str = info[4][0]
+        bare = ip_str.split("%")[0]  # 去掉 IPv6 zone id 再做类别判断
         try:
-            ip = ipaddress.ip_address(ip_str.split("%")[0])
+            ip = ipaddress.ip_address(bare)
         except ValueError:
             continue
         if (ip.is_loopback or ip.is_private or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             raise FetchError(f"目标解析到受限地址({ip_str}),拒绝访问")
+        checked.append(bare)
+    return checked
 
 
 def _validate_url(url: str) -> str:
@@ -82,6 +93,113 @@ def _validate_url(url: str) -> str:
         raise FetchError("URL 缺少主机名")
     _check_host(parsed.hostname)
     return url
+
+
+def _split_host_port(host: str, default_port: int) -> tuple[str, int]:
+    """从 req.host(可能是 host 或 host:port,IPv6 带 [])解析出名字和端口。"""
+    if not host:
+        return host, default_port
+    if host.startswith("["):
+        end = host.find("]")
+        if end == -1:
+            return host, default_port
+        hostname = host[1:end]
+        rest = host[end + 1:]
+        if rest.startswith(":"):
+            try:
+                return hostname, int(rest[1:])
+            except ValueError:
+                return hostname, default_port
+        return hostname, default_port
+    if ":" in host:
+        hostname, _, port_s = host.rpartition(":")
+        try:
+            return hostname, int(port_s)
+        except ValueError:
+            return host, default_port
+    return host, default_port
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """connect() 连到已校验的固定 IP,不再重复解析域名(DNS rebinding 防护)。"""
+
+    _pinned_ip: str | None = None
+
+    def connect(self) -> None:
+        if not self._pinned_ip:
+            return super().connect()
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address)
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """同上;TLS 握手仍用原域名(SNI 与证书验证保持正确)。"""
+
+    _pinned_ip: str | None = None
+
+    def connect(self) -> None:
+        if not self._pinned_ip:
+            return super().connect()
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address)
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        if self._tunnel_host:
+            self._tunnel()
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+def _pin_ip_for(req: urllib.request.Request, default_port: int) -> str | None:
+    """解析并检查目标 host,返回可 pin 的 IP。
+
+    只对【直连】场景生效:连接目标(req.host)== URL 目标时,把校验过的
+    IP 钉给连接层。走代理时(req.host 是代理地址)跳过 pin —— 连接目标
+    是用户自己配置的代理基础设施,不归 SSRF 检查管;且不能拿 URL 的
+    校验结果去 pin 代理连接。
+
+    实测踩过的坑:不区分直连/代理时,本机 http_proxy=127.0.0.1:10809
+    会让所有请求的 req.host 变成代理地址,被 SSRF 检查误拒。
+    """
+    parsed = urllib.parse.urlparse(req.get_full_url())
+    hostname = parsed.hostname
+    if not hostname:
+        return None
+
+    # 无论直连还是代理,URL 目标本身必须过检查(SSRF 拦截不因代理而豁免)
+    checked = _check_host(hostname)
+
+    # 连接目标与 URL 目标不同 → 走的是代理,跳过 pin
+    conn_host, _ = _split_host_port(req.host or "", default_port)
+    if not conn_host or conn_host.lower() != hostname.lower():
+        return None
+    return checked[0] if checked else None
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    """建连前解析+检查,直连时把校验过的 IP 钉进连接类(不再二次解析)。"""
+
+    def http_open(self, req):
+        ip = _pin_ip_for(req, 80)
+        cls = type("_PinnedHTTPConn", (_PinnedHTTPConnection,), {"_pinned_ip": ip})
+        return self.do_open(cls, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    """同上(HTTPS 版,context 透传给 TLS 层)。"""
+
+    def https_open(self, req):
+        ip = _pin_ip_for(req, 443)
+        cls = type("_PinnedHTTPSConn", (_PinnedHTTPSConnection,), {"_pinned_ip": ip})
+        return self.do_open(cls, req, context=self._context)
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -152,8 +270,12 @@ class _TextExtractor(HTMLParser):
 
 
 def _opener() -> urllib.request.OpenerDirector:
-    """带 SSRF 安全检查的重定向处理器的 opener。"""
-    return urllib.request.build_opener(_SafeRedirectHandler())
+    """带 SSRF 防护的 opener:
+    - 重定向每跳重校验(_SafeRedirectHandler)
+    - 连接 pin 已校验 IP(_PinnedHTTP(S)Handler,防 DNS rebinding)
+    """
+    return urllib.request.build_opener(
+        _SafeRedirectHandler(), _PinnedHTTPHandler(), _PinnedHTTPSHandler())
 
 
 def _http_get(url: str) -> tuple[bytes, str, str]:

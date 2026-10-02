@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -261,10 +262,14 @@ class TestRedirectSSRF:
         redirector = HTTPServer(("127.0.0.2", 0), _R)
         threading.Thread(target=redirector.serve_forever, daemon=True).start()
 
-        def patched(host: str) -> None:
+        # 保留原函数引用 —— monkeypatch 之后 srv._check_host 就是 patched 自己,
+        # 直接调用会无限递归(实测踩过)。
+        real_check = srv._check_host
+
+        def patched(host: str):
             if host in ("127.0.0.2", "127.0.0.3"):
-                return
-            srv._check_host(host)
+                return ["127.0.0.2"] if host == "127.0.0.2" else ["127.0.0.3"]
+            return real_check(host)
 
         monkeypatch.setattr(srv, "_check_host", patched)
         try:
@@ -273,3 +278,71 @@ class TestRedirectSSRF:
         finally:
             redirector.shutdown()
             inner.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# DNS rebinding 防护(pin 机制)
+# ---------------------------------------------------------------------------
+
+class TestPinnedConnection:
+    """连接直接使用已校验的 IP,不再二次解析(DNS rebinding 防护)。
+
+    实测验证方式:让一个"假域名"解析到本地(无法用 /etc/hosts 时用
+    monkeypatch getaddrinfo),pin 生效时连接用的是检查时那个 IP,
+    域名在检查后被"改写"也不影响已建立的连接目标。
+    """
+
+    def test_pin_used_when_direct(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """直连场景:req.host 与 URL 目标一致时,_pin_ip_for 返回检查过的 IP。"""
+        monkeypatch.setattr(srv, "_check_host", lambda h: ["203.0.113.7"])
+        req = urllib.request.Request("http://example.test/x")
+        assert req.host == "example.test"
+        assert srv._pin_ip_for(req, 80) == "203.0.113.7"
+
+    def test_no_pin_when_proxied(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """代理场景:req.host 是代理地址时不做 pin(但仍检查 URL 目标)。"""
+        seen: list[str] = []
+
+        def fake_check(h: str):
+            seen.append(h)
+            return ["203.0.113.7"]
+
+        monkeypatch.setattr(srv, "_check_host", fake_check)
+        req = urllib.request.Request("http://example.test/x")
+        req.host = "127.0.0.1:10809"          # 模拟 urllib 走代理后的状态
+        assert srv._pin_ip_for(req, 80) is None, "代理场景不应 pin"
+        assert "example.test" in seen, "URL 目标仍必须过 SSRF 检查"
+
+    def test_pinned_connection_bypasses_dns(self) -> None:
+        """pin 生效时连接不查 DNS:用一个不存在的域名 + pin 到本地服务器验证。"""
+        import socket as _socket
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = b"PINNED-OK"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srvr = HTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=srvr.serve_forever, daemon=True).start()
+        try:
+            conn = srv._PinnedHTTPConnection("definitely-not-a-real-domain.invalid",
+                                             srvr.server_port)
+            conn._pinned_ip = "127.0.0.1"
+            conn.request("GET", "/")
+            assert conn.getresponse().read() == b"PINNED-OK"
+            conn.close()
+
+            # 对照:无 pin 时该域名解析必然失败
+            conn2 = srv._PinnedHTTPConnection("definitely-not-a-real-domain.invalid",
+                                              srvr.server_port)
+            with pytest.raises(_socket.gaierror):
+                conn2.connect()
+        finally:
+            srvr.shutdown()
